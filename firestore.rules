@@ -1,0 +1,57 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // 0. Default Deny
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Helpers
+    function isSignedIn() {
+      return request.auth != null;
+    }
+    
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    // 1. User Profiles
+    match /users/{userId} {
+      allow get: if isOwner(userId);
+      allow create: if isOwner(userId) 
+        && incoming().email == request.auth.token.email
+        && incoming().keys().hasAll(['email', 'createdAt'])
+        && incoming().keys().size() <= 6;
+      allow update: if isOwner(userId)
+        && incoming().email == existing().email
+        && incoming().diff(existing()).affectedKeys().hasOnly(['displayName', 'photoURL']);
+    }
+
+    // 2. Wallets
+    // Only READ allowed by user. Writes MUST be server-side via Admin SDK.
+    match /wallets/{userId} {
+      allow get: if isOwner(userId);
+      allow list: if isOwner(userId); // In case they query wallets
+    }
+
+    // 3. Transactions
+    match /transactions/{txnId} {
+      allow get: if isSignedIn() && existing().userId == request.auth.uid;
+      allow list: if isSignedIn() && resource.data.userId == request.auth.uid;
+      // No user writes allowed to transactions to prevent balance spoofing.
+      // The server will create transactions.
+    }
+  }
+}
