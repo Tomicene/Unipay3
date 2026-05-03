@@ -8,7 +8,10 @@ import {
   onAuthStateChanged, 
   signInWithPopup, 
   signOut, 
-  User 
+  User,
+  createUserWithEmailAndPassword,
+  signInWithEmailAndPassword,
+  updateProfile
 } from "firebase/auth";
 import { 
   doc, 
@@ -28,10 +31,13 @@ import {
   History, 
   LogOut, 
   CreditCard,
-  ChevronRight,
   Loader2,
   TrendingUp,
-  ShieldCheck
+  ShieldCheck,
+  Mail,
+  Lock,
+  User as UserIcon,
+  Phone
 } from "lucide-react";
 import { motion, AnimatePresence } from "motion/react";
 import axios from "axios";
@@ -60,6 +66,14 @@ export default function App() {
   const [isFundModalOpen, setIsFundModalOpen] = useState(false);
   const [fundAmount, setFundAmount] = useState("");
   const [fundingLoading, setFundingLoading] = useState(false);
+  
+  // Auth Form State
+  const [isSignup, setIsSignup] = useState(false);
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [fullName, setFullName] = useState("");
+  const [phone, setPhone] = useState("");
+  const [authLoading, setAuthLoading] = useState(false);
 
   useEffect(() => {
     const unsubscribe = onAuthStateChanged(auth, async (user) => {
@@ -70,8 +84,9 @@ export default function App() {
         try {
           await setDoc(userRef, {
             email: user.email,
-            displayName: user.displayName,
+            displayName: user.displayName || fullName || "Unipay User",
             photoURL: user.photoURL,
+            phone: user.phoneNumber || phone,
             createdAt: serverTimestamp(),
           }, { merge: true });
         } catch (e) {
@@ -84,7 +99,7 @@ export default function App() {
     });
 
     return () => unsubscribe();
-  }, []);
+  }, [fullName, phone]);
 
   useEffect(() => {
     if (!user) return;
@@ -116,11 +131,31 @@ export default function App() {
     };
   }, [user]);
 
-  const handleLogin = async () => {
+  const handleGoogleLogin = async () => {
     try {
       await signInWithPopup(auth, googleProvider);
     } catch (e) {
       console.error("Login failed", e);
+    }
+  };
+
+  const handleEmailAuth = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setAuthLoading(true);
+    try {
+      if (isSignup) {
+        const userCred = await createUserWithEmailAndPassword(auth, email, password);
+        if (fullName) {
+          await updateProfile(userCred.user, { displayName: fullName });
+        }
+      } else {
+        await signInWithEmailAndPassword(auth, email, password);
+      }
+    } catch (e: any) {
+      console.error("Auth error", e);
+      alert(e.message || "Authentication failed");
+    } finally {
+      setAuthLoading(false);
     }
   };
 
@@ -169,44 +204,117 @@ export default function App() {
         <motion.div 
           initial={{ opacity: 0, y: 20 }}
           animate={{ opacity: 1, y: 0 }}
-          className="max-w-md w-full text-center space-y-8"
+          className="max-w-md w-full space-y-8"
         >
-          <div className="flex justify-center">
-            <div className="w-20 h-20 bg-blue-600 rounded-2xl flex items-center justify-center shadow-xl shadow-blue-200">
-              <Wallet className="w-10 h-10 text-white" />
+          <div className="text-center space-y-2">
+            <div className="flex justify-center mb-4">
+              <div className="w-16 h-16 bg-blue-600 rounded-2xl flex items-center justify-center shadow-xl shadow-blue-200">
+                <Wallet className="w-8 h-8 text-white" />
+              </div>
             </div>
-          </div>
-          <div className="space-y-2">
-            <h1 className="text-4xl font-bold tracking-tight text-slate-900">Unipay</h1>
-            <p className="text-slate-500">Your secure portal to seamless Naira payments</p>
+            <h1 className="text-3xl font-bold tracking-tight text-slate-900">Unipay</h1>
+            <p className="text-slate-500 font-medium">{isSignup ? "Create your secure account" : "Welcome back to Unipay"}</p>
           </div>
           
-          <div className="grid grid-cols-1 gap-4 text-left">
-            <div className="p-4 bg-slate-50 rounded-xl border border-slate-100 flex items-center gap-4">
-              <div className="bg-green-100 p-2 rounded-lg"><TrendingUp className="w-5 h-5 text-green-600" /></div>
-              <div>
-                <p className="font-medium text-slate-900 text-sm">Real-time Wallets</p>
-                <p className="text-xs text-slate-500">Instant funding & historical logs</p>
+          <form onSubmit={handleEmailAuth} className="space-y-4">
+            {isSignup && (
+              <div className="space-y-1">
+                <label className="text-xs font-bold text-slate-500 ml-1">FULL NAME</label>
+                <div className="relative">
+                  <UserIcon className="absolute left-4 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400" />
+                  <input 
+                    type="text" 
+                    required
+                    value={fullName}
+                    onChange={(e) => setFullName(e.target.value)}
+                    placeholder="John Doe"
+                    className="w-full bg-slate-50 border border-slate-100 rounded-xl py-3 pl-11 pr-4 text-sm focus:outline-none focus:ring-2 focus:ring-blue-600/20"
+                  />
+                </div>
+              </div>
+            )}
+            
+            <div className="space-y-1">
+              <label className="text-xs font-bold text-slate-500 ml-1">EMAIL ADDRESS</label>
+              <div className="relative">
+                <Mail className="absolute left-4 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400" />
+                <input 
+                  type="email" 
+                  required
+                  value={email}
+                  onChange={(e) => setEmail(e.target.value)}
+                  placeholder="name@example.com"
+                  className="w-full bg-slate-50 border border-slate-100 rounded-xl py-3 pl-11 pr-4 text-sm focus:outline-none focus:ring-2 focus:ring-blue-600/20"
+                />
               </div>
             </div>
-            <div className="p-4 bg-slate-50 rounded-xl border border-slate-100 flex items-center gap-4">
-              <div className="bg-blue-100 p-2 rounded-lg"><ShieldCheck className="w-5 h-5 text-blue-600" /></div>
-              <div>
-                <p className="font-medium text-slate-900 text-sm">Monnify Integrated</p>
-                <p className="text-xs text-slate-500">Card & Bank transfer supported</p>
+
+            {isSignup && (
+              <div className="space-y-1">
+                <label className="text-xs font-bold text-slate-500 ml-1">PHONE NUMBER (OPTIONAL)</label>
+                <div className="relative">
+                  <Phone className="absolute left-4 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400" />
+                  <input 
+                    type="tel" 
+                    value={phone}
+                    onChange={(e) => setPhone(e.target.value)}
+                    placeholder="+234..."
+                    className="w-full bg-slate-50 border border-slate-100 rounded-xl py-3 pl-11 pr-4 text-sm focus:outline-none focus:ring-2 focus:ring-blue-600/20"
+                  />
+                </div>
+              </div>
+            )}
+
+            <div className="space-y-1">
+              <label className="text-xs font-bold text-slate-500 ml-1">PASSWORD</label>
+              <div className="relative">
+                <Lock className="absolute left-4 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400" />
+                <input 
+                  type="password" 
+                  required
+                  value={password}
+                  onChange={(e) => setPassword(e.target.value)}
+                  placeholder="••••••••"
+                  className="w-full bg-slate-50 border border-slate-100 rounded-xl py-3 pl-11 pr-4 text-sm focus:outline-none focus:ring-2 focus:ring-blue-600/20"
+                />
               </div>
             </div>
+
+            <button 
+              type="submit"
+              disabled={authLoading}
+              className="w-full bg-blue-600 text-white font-bold py-3.5 rounded-xl shadow-lg shadow-blue-100 hover:bg-blue-700 transition-all flex items-center justify-center gap-2"
+            >
+              {authLoading ? <Loader2 className="w-5 h-5 animate-spin" /> : (isSignup ? "Create Account" : "Sign In")}
+            </button>
+          </form>
+
+          <div className="relative">
+            <div className="absolute inset-0 flex items-center"><div className="w-full border-t border-slate-100"></div></div>
+            <div className="relative flex justify-center text-xs uppercase"><span className="bg-white px-4 text-slate-400 font-bold">Or continue with</span></div>
           </div>
 
           <button 
-            onClick={handleLogin}
-            className="w-full bg-slate-900 text-white font-semibold py-4 rounded-xl shadow-lg hover:bg-slate-800 transition-all flex items-center justify-center gap-3"
+            onClick={handleGoogleLogin}
+            className="w-full bg-white border border-slate-200 text-slate-900 font-bold py-3 rounded-xl hover:bg-slate-50 transition-all flex items-center justify-center gap-3"
           >
-            <img src="https://www.google.com/favicon.ico" className="w-5 h-5" alt="Google" />
-            Sign in with Google
+            <img src="https://www.google.com/favicon.ico" className="w-4 h-4" alt="Google" />
+            Google
           </button>
           
-          <p className="text-xs text-slate-400">By continuing, you agree to Unipay's Terms of Service</p>
+          <p className="text-center text-sm text-slate-500">
+            {isSignup ? "Already have an account?" : "Don't have an account?"}{" "}
+            <button 
+              onClick={() => setIsSignup(!isSignup)}
+              className="text-blue-600 font-bold hover:underline"
+            >
+              {isSignup ? "Log In" : "Sign Up"}
+            </button>
+          </p>
+
+          <p className="text-[10px] text-center text-slate-400 px-8">
+            By continuing, you agree to Unipay's Terms of Service and Privacy Policy. Securely integrated with Monnify.
+          </p>
         </motion.div>
       </div>
     );
@@ -225,7 +333,7 @@ export default function App() {
           </div>
           <div className="flex items-center gap-3">
             <div className="text-right hidden sm:block">
-              <p className="text-xs font-semibold text-slate-900">{user.displayName}</p>
+              <p className="text-xs font-semibold text-slate-900">{user.displayName || "User"}</p>
               <p className="text-[10px] text-slate-500">{user.email}</p>
             </div>
             <button 
@@ -314,14 +422,14 @@ export default function App() {
                 <div key={tx.id} className="p-4 flex items-center justify-between hover:bg-slate-50 transition-colors">
                   <div className="flex items-center gap-3">
                     <div className={`p-2 rounded-full ${
-                      tx.type === "FUNDING" ? "bg-green-100 text-green-600" : "bg-red-100 text-red-600"
+                      tx.status === "SUCCESS" ? (tx.type === "FUNDING" ? "bg-green-100 text-green-600" : "bg-red-100 text-red-600") : "bg-yellow-100 text-yellow-600"
                     }`}>
                       {tx.type === "FUNDING" ? <ArrowDownLeft className="w-4 h-4" /> : <ArrowUpRight className="w-4 h-4" />}
                     </div>
                     <div>
                       <p className="text-sm font-bold truncate max-w-[150px]">{tx.description}</p>
                       <p className="text-[10px] text-slate-400">
-                        {tx.createdAt?.toDate().toLocaleDateString()} · {tx.status}
+                        {tx.createdAt?.toDate ? tx.createdAt.toDate().toLocaleDateString() : "Just now"} · {tx.status}
                       </p>
                     </div>
                   </div>

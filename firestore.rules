@@ -33,10 +33,10 @@ service cloud.firestore {
       allow create: if isOwner(userId) 
         && incoming().email == request.auth.token.email
         && incoming().keys().hasAll(['email', 'createdAt'])
-        && incoming().keys().size() <= 6;
+        && incoming().keys().size() <= 8;
       allow update: if isOwner(userId)
         && incoming().email == existing().email
-        && incoming().diff(existing()).affectedKeys().hasOnly(['displayName', 'photoURL']);
+        && incoming().diff(existing()).affectedKeys().hasOnly(['displayName', 'photoURL', 'phone']);
     }
 
     // 2. Wallets
