@@ -36,7 +36,7 @@ service cloud.firestore {
         && incoming().keys().size() <= 8;
       allow update: if isOwner(userId)
         && incoming().email == existing().email
-        && incoming().diff(existing()).affectedKeys().hasOnly(['displayName', 'photoURL', 'phone']);
+        && incoming().diff(existing()).affectedKeys().hasOnly(['displayName', 'photoURL', 'phone', 'biometricsEnabled', 'authenticators']);
     }
 
     // 2. Wallets

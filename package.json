@@ -12,6 +12,8 @@
   },
   "dependencies": {
     "@google/genai": "^1.29.0",
+    "@simplewebauthn/browser": "^13.3.0",
+    "@simplewebauthn/server": "^13.3.0",
     "@tailwindcss/vite": "^4.1.14",
     "@types/uuid": "^10.0.0",
     "@vitejs/plugin-react": "^5.0.4",

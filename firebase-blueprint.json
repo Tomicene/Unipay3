@@ -9,6 +9,19 @@
         "displayName": { "type": "string" },
         "photoURL": { "type": "string" },
         "phone": { "type": "string" },
+        "biometricsEnabled": { "type": "boolean" },
+        "authenticators": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "credentialID": { "type": "string" },
+              "credentialPublicKey": { "type": "string" },
+              "counter": { "type": "number" },
+              "transports": { "type": "array", "items": { "type": "string" } }
+            }
+          }
+        },
         "createdAt": { "type": "string", "format": "date-time" }
       },
       "required": ["email", "createdAt"]
