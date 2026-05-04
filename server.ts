@@ -580,14 +580,20 @@ async function startServer() {
     }
   });
 
-  // 3. Get Banks
+  // 3. Get Banks - Deduplicated
   app.get("/api/banks", async (req, res) => {
     try {
       const response = await axios.get("https://api.paystack.co/bank?country=nigeria", {
         headers: paystackHeaders,
       });
-      res.json(response.data.data);
+      
+      const banks = response.data.data;
+      // Deduplicate by code to prevent React duplicate key errors
+      const uniqueBanks = Array.from(new Map(banks.map((bank: any) => [bank.code, bank])).values());
+      
+      res.json(uniqueBanks);
     } catch (error) {
+      console.error("Fetch banks error:", error);
       res.status(500).json({ error: "Failed to fetch banks" });
     }
   });

@@ -718,11 +718,11 @@ export default function App() {
                     <p className="text-xs text-slate-400">Your recent payments will appear here</p>
                   </div>
                 ) : (
-                  transactions.slice(0, 10).map((tx) => (
+                  transactions.slice(0, 10).map((tx, index) => (
                     <motion.div 
                       initial={{ opacity: 0 }}
                       animate={{ opacity: 1 }}
-                      key={tx.id} 
+                      key={`${tx.id}-${index}`} 
                       className="p-4 flex items-center justify-between hover:bg-slate-50/50 transition-colors"
                     >
                       <div className="flex items-center gap-3">
@@ -993,8 +993,8 @@ export default function App() {
                     className="w-full bg-slate-50 border border-slate-100 rounded-xl py-3 px-4 font-medium text-sm focus:outline-none focus:ring-2 focus:ring-blue-600/20"
                   >
                     <option value="">Choose a bank</option>
-                    {banks.map(bank => (
-                      <option key={bank.code} value={bank.code}>{bank.name}</option>
+                    {banks.map((bank, index) => (
+                      <option key={`${bank.code}-${index}`} value={bank.code}>{bank.name}</option>
                     ))}
                   </select>
                 </div>
