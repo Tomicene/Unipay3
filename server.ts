@@ -3,6 +3,7 @@ import { createServer as createViteServer } from "vite";
 import path from "path";
 import fs from "fs";
 import axios from "axios";
+import crypto from "crypto";
 import { v4 as uuidv4 } from "uuid";
 import { initializeApp, getApps } from "firebase-admin/app";
 import { getFirestore, FieldValue } from "firebase-admin/firestore";
@@ -20,9 +21,7 @@ const firebaseConfig = JSON.parse(fs.readFileSync(path.join(process.cwd(), "fire
 
 // Initialize Firebase Admin
 if (getApps().length === 0) {
-  initializeApp({
-    projectId: firebaseConfig.projectId,
-  });
+  initializeApp();
 }
 
 async function startServer() {
@@ -33,8 +32,12 @@ async function startServer() {
 
   // Helper to get Firestore with correct DB ID
   const getDB = () => {
-    if (firebaseConfig.firestoreDatabaseId) {
-      return getFirestore(firebaseConfig.firestoreDatabaseId);
+    try {
+      if (firebaseConfig.firestoreDatabaseId) {
+        return getFirestore(firebaseConfig.firestoreDatabaseId);
+      }
+    } catch (e) {
+      console.warn("Explicit DB ID initialization failed, falling back to default", e);
     }
     return getFirestore();
   };
@@ -217,32 +220,304 @@ async function startServer() {
     try {
       const { amount, customerEmail, userId } = req.body;
       if (!userId) return res.status(400).json({ error: "userId is required" });
+      
+      const PAYSTACK_SECRET = process.env.PAYSTACK_SECRET_KEY;
+      if (!PAYSTACK_SECRET) {
+        console.error("PAYSTACK_SECRET_KEY is missing in environment variables");
+        return res.status(500).json({ error: "Server configuration error: Paystack key missing" });
+      }
 
       const reference = `unipay_ps_${uuidv4().replace(/-/g, "")}`;
+      const appUrl = process.env.APP_URL || origin;
 
       const payload = {
-        amount: amount * 100, // Paystack uses kobo
+        amount: Math.round(Number(amount) * 100), // Paystack uses kobo
         email: customerEmail,
         reference: reference,
-        callback_url: `${process.env.APP_URL}/dashboard`,
+        callback_url: `${appUrl}/dashboard`,
         metadata: {
           userId: userId,
         },
       };
 
+      console.log("Initiating Paystack payment with payload:", JSON.stringify(payload));
+
       const response = await axios.post(
         "https://api.paystack.co/transaction/initialize",
         payload,
-        { headers: paystackHeaders }
+        { 
+          headers: {
+            Authorization: `Bearer ${PAYSTACK_SECRET}`,
+            "Content-Type": "application/json",
+          }
+        }
       );
+
+      console.log("Paystack response:", JSON.stringify(response.data));
+      
+      if (!response.data.status) {
+        return res.status(400).json({ 
+          error: "Paystack initiation failed", 
+          details: response.data.message 
+        });
+      }
+
+      if (!response.data.data?.authorization_url) {
+        return res.status(500).json({ 
+          error: "Internal error", 
+          details: "No authorization URL returned from Paystack" 
+        });
+      }
 
       res.json({ 
         checkoutUrl: response.data.data.authorization_url, 
         reference 
       });
     } catch (error: any) {
-      console.error("Paystack initiation error:", error.response?.data || error.message);
-      res.status(500).json({ error: "Failed to initiate payment" });
+      console.error("Paystack initiation error details:", {
+        message: error.message,
+        response: error.response?.data,
+        config: error.config ? { url: error.config.url, data: error.config.data } : "No config"
+      });
+      res.status(500).json({ 
+        error: "Failed to initiate payment", 
+        details: error.response?.data?.message || error.message 
+      });
+    }
+  });
+
+  // Webhook Endpoint for Paystack
+  app.post("/api/webhooks/paystack", async (req, res) => {
+    try {
+      const hash = crypto
+        .createHmac("sha512", process.env.PAYSTACK_SECRET_KEY || "")
+        .update(JSON.stringify(req.body))
+        .digest("hex");
+
+      if (hash !== req.headers["x-paystack-signature"]) {
+        console.error("Invalid Paystack signature");
+        return res.sendStatus(400);
+      }
+
+      const event = req.body;
+      console.log("Paystack Webhook Event:", event.event);
+
+      if (event.event === "charge.success") {
+        const data = event.data;
+        const userId = data.metadata?.userId;
+        const amountPaid = data.amount / 100;
+        const reference = data.reference;
+
+        if (userId) {
+          const db = getDB();
+          const walletRef = db.collection("wallets").doc(userId);
+          const txnRef = db.collection("transactions").doc(reference);
+
+          await db.runTransaction(async (t) => {
+            const txnDoc = await t.get(txnRef);
+            // Prevent double-crediting
+            if (txnDoc.exists && txnDoc.data()?.status === "SUCCESS") {
+              console.log(`Transaction ${reference} already processed.`);
+              return;
+            }
+
+            const walletDoc = await t.get(walletRef);
+            const currentBalance = walletDoc.exists ? (walletDoc.data()?.balance || 0) : 0;
+            
+            t.set(walletRef, {
+              userId,
+              balance: currentBalance + amountPaid,
+              currency: "NGN",
+              updatedAt: FieldValue.serverTimestamp(),
+            }, { merge: true });
+
+            t.set(txnRef, {
+              userId,
+              amount: amountPaid,
+              type: "FUNDING",
+              status: "SUCCESS",
+              reference: reference,
+              description: "Wallet Funding (via Webhook)",
+              createdAt: FieldValue.serverTimestamp(),
+            }, { merge: true });
+          });
+          
+          console.log(`Successfully credited ${amountPaid} to user ${userId} via webhook`);
+        }
+      }
+
+      res.sendStatus(200);
+    } catch (error) {
+      console.error("Webhook processing error:", error);
+      res.sendStatus(500);
+    }
+  });
+
+  // manual report and auto-fix endpoint
+  app.post("/api/payments/report-missing", async (req, res) => {
+    try {
+      const { reference, userId, email } = req.body;
+      if (!reference) return res.status(400).json({ error: "Reference is required" });
+
+      const PAYSTACK_SECRET = process.env.PAYSTACK_SECRET_KEY;
+      
+      // 1. Verify with Paystack
+      const response = await axios.get(
+        `https://api.paystack.co/transaction/verify/${reference}`,
+        { headers: { Authorization: `Bearer ${PAYSTACK_SECRET}` } }
+      );
+
+      const data = response.data.data;
+      const db = getDB();
+
+      // Log the report regardless of outcome
+      await db.collection("support_reports").add({
+        userId,
+        email,
+        reference,
+        paystackStatus: data.status,
+        reportedAt: FieldValue.serverTimestamp(),
+        resolved: data.status === "success"
+      });
+
+      if (data.status === "success") {
+        const amountPaid = data.amount / 100;
+        const walletRef = db.collection("wallets").doc(userId);
+        const txnRef = db.collection("transactions").doc(reference);
+
+        let alreadyProcessed = false;
+
+        await db.runTransaction(async (t) => {
+          const txnDoc = await t.get(txnRef);
+          if (txnDoc.exists && txnDoc.data()?.status === "SUCCESS") {
+            alreadyProcessed = true;
+            return;
+          }
+
+          const walletDoc = await t.get(walletRef);
+          const currentBalance = walletDoc.exists ? (walletDoc.data()?.balance || 0) : 0;
+          
+          t.set(walletRef, {
+            userId,
+            balance: currentBalance + amountPaid,
+            currency: "NGN",
+            updatedAt: FieldValue.serverTimestamp(),
+          }, { merge: true });
+
+          t.set(txnRef, {
+            userId,
+            amount: amountPaid,
+            type: "FUNDING",
+            status: "SUCCESS",
+            reference: reference,
+            description: "Wallet Funding (via Manual Report)",
+            createdAt: FieldValue.serverTimestamp(),
+          }, { merge: true });
+        });
+
+        if (alreadyProcessed) {
+          return res.json({ status: "already_processed", message: "This payment was already credited to your account." });
+        }
+
+        return res.json({ status: "success", message: `Found! ₦${amountPaid} has been added to your balance.` });
+      } else {
+        return res.status(400).json({ 
+          status: "failed", 
+          message: `Paystack returns: ${data.gateway_response || "Unsuccessful payment"}. Please ensure the reference is correct.` 
+        });
+      }
+    } catch (error: any) {
+      console.error("Report processing error:", error.response?.data || error.message);
+      res.status(500).json({ error: "Failed to process report. Please try again later." });
+    }
+  });
+
+  // Verification Endpoint (Manual fallback)
+  app.get("/api/payments/verify/:reference", async (req, res) => {
+    try {
+      const { reference } = req.params;
+      const PAYSTACK_SECRET = process.env.PAYSTACK_SECRET_KEY;
+      
+      const response = await axios.get(
+        `https://api.paystack.co/transaction/verify/${reference}`,
+        { headers: { Authorization: `Bearer ${PAYSTACK_SECRET}` } }
+      );
+
+      const data = response.data.data;
+      if (data.status === "success") {
+        const userId = data.metadata?.userId;
+        const amountPaid = data.amount / 100;
+
+        if (userId) {
+          const db = getDB();
+          const walletRef = db.collection("wallets").doc(userId);
+          const txnRef = db.collection("transactions").doc(reference);
+
+          await db.runTransaction(async (t) => {
+            const txnDoc = await t.get(txnRef);
+            // Only update if not already processed successfully
+            if (txnDoc.exists && txnDoc.data()?.status === "SUCCESS") {
+              return; 
+            }
+
+            const walletDoc = await t.get(walletRef);
+            const currentBalance = walletDoc.exists ? (walletDoc.data()?.balance || 0) : 0;
+            
+            t.set(walletRef, {
+              userId,
+              balance: currentBalance + amountPaid,
+              currency: "NGN",
+              updatedAt: FieldValue.serverTimestamp(),
+            }, { merge: true });
+
+            t.set(txnRef, {
+              userId,
+              amount: amountPaid,
+              type: "FUNDING",
+              status: "SUCCESS",
+              reference: reference,
+              description: "Wallet Funding via Paystack (Verified)",
+              createdAt: FieldValue.serverTimestamp(),
+            }, { merge: true });
+          });
+
+          return res.json({ status: "success", amount: amountPaid });
+        }
+      }
+      
+      res.json({ status: data.status, message: data.gateway_response });
+    } catch (error: any) {
+      console.error("Verification error:", error.response?.data || error.message);
+      res.status(500).json({ error: "Failed to verify transaction" });
+    }
+  });
+
+  // Profile Update Endpoint
+  app.post("/api/user/profile", async (req, res) => {
+    try {
+      const { userId, displayName, phone } = req.body;
+      if (!userId) return res.status(400).json({ error: "userId is required" });
+
+      const db = getDB();
+      const userRef = db.collection("users").doc(userId);
+
+      console.log(`Updating profile for user ${userId}:`, { displayName, phone });
+
+      await userRef.set({
+        displayName,
+        phone,
+        updatedAt: FieldValue.serverTimestamp(),
+      }, { merge: true });
+
+      res.json({ message: "Profile updated successfully" });
+    } catch (error: any) {
+      console.error("Profile update error detail:", {
+        message: error.message,
+        code: error.code,
+        details: error.details,
+        stack: error.stack
+      });
+      res.status(500).json({ error: `Failed to update profile: ${error.message}` });
     }
   });
 

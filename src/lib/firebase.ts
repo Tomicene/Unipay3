@@ -43,8 +43,9 @@ export interface FirestoreErrorInfo {
 }
 
 export function handleFirestoreError(error: unknown, operationType: OperationType, path: string | null) {
+  const errMessage = error instanceof Error ? error.message : String(error);
   const errInfo: FirestoreErrorInfo = {
-    error: error instanceof Error ? error.message : String(error),
+    error: errMessage,
     authInfo: {
       userId: auth.currentUser?.uid,
       email: auth.currentUser?.email,
@@ -54,6 +55,14 @@ export function handleFirestoreError(error: unknown, operationType: OperationTyp
     operationType,
     path,
   };
-  console.error("Firestore Error: ", JSON.stringify(errInfo));
+  
+  const detailString = JSON.stringify(errInfo, null, 2);
+  console.error("Firestore Error Detailed: ", detailString);
+  
+  // Also alert if it's a critical permission issue to help user diagnose
+  if (errMessage.includes("insufficient permissions")) {
+    console.warn("Permission denied. Check if the user is signed in and the rules are deployed correctly.");
+  }
+  
   throw new Error(JSON.stringify(errInfo));
 }

@@ -16,6 +16,8 @@ import {
 import { 
   doc, 
   setDoc, 
+  updateDoc,
+  getDoc,
   onSnapshot, 
   collection, 
   query, 
@@ -38,7 +40,8 @@ import {
   Lock,
   User as UserIcon,
   Phone,
-  Fingerprint
+  Fingerprint,
+  HelpCircle
 } from "lucide-react";
 import { motion, AnimatePresence } from "motion/react";
 import axios from "axios";
@@ -68,8 +71,12 @@ export default function App() {
   const [transactions, setTransactions] = useState<Transaction[]>([]);
   const [isFundModalOpen, setIsFundModalOpen] = useState(false);
   const [isSendModalOpen, setIsSendModalOpen] = useState(false);
+  const [activeTab, setActiveTab] = useState<"home" | "profile">("home");
   const [fundAmount, setFundAmount] = useState("");
   const [fundingLoading, setFundingLoading] = useState(false);
+  
+  // Profile Update State
+  const [updateLoading, setUpdateLoading] = useState(false);
   
   // Send Money Form State
   const [banks, setBanks] = useState<{name: string, code: string}[]>([]);
@@ -137,16 +144,40 @@ export default function App() {
     const unsubscribe = onAuthStateChanged(auth, async (user) => {
       if (user) {
         setUser(user);
+        if (user.displayName) setFullName(user.displayName);
         // Ensure user document exists
         const userRef = doc(db, "users", user.uid);
         try {
-          await setDoc(userRef, {
-            email: user.email,
-            displayName: user.displayName || fullName || "Unipay User",
-            photoURL: user.photoURL,
-            phone: user.phoneNumber || phone,
-            createdAt: serverTimestamp(),
-          }, { merge: true });
+          // Listen to user doc for profile data
+          onSnapshot(userRef, (docSnap) => {
+            if (docSnap.exists()) {
+              const data = docSnap.data();
+              if (data.phone) setPhone(data.phone);
+              if (data.displayName) setFullName(data.displayName);
+            }
+          }, (err) => handleFirestoreError(err, OperationType.GET, `users/${user.uid}`));
+          
+          const userSnap = await getDoc(userRef);
+          if (!userSnap.exists()) {
+            await setDoc(userRef, {
+              email: user.email,
+              displayName: user.displayName || fullName || "Unipay User",
+              photoURL: user.photoURL,
+              phone: user.phoneNumber || phone,
+              createdAt: serverTimestamp(),
+            });
+          } else {
+            // Update fields if they are recently provided but missing in DB
+            const data = userSnap.data();
+            const updateFields: any = {};
+            if (!data.displayName && (user.displayName || fullName)) updateFields.displayName = user.displayName || fullName;
+            if (!data.phone && (user.phoneNumber || phone)) updateFields.phone = user.phoneNumber || phone;
+            if (!data.photoURL && user.photoURL) updateFields.photoURL = user.photoURL;
+            
+            if (Object.keys(updateFields).length > 0) {
+              await updateDoc(userRef, updateFields);
+            }
+          }
         } catch (e) {
           handleFirestoreError(e, OperationType.WRITE, "users");
         }
@@ -157,10 +188,33 @@ export default function App() {
     });
 
     return () => unsubscribe();
-  }, [fullName, phone]);
+  }, []); // Only run on mount
 
   useEffect(() => {
     if (!user) return;
+
+    // Check for Paystack redirect parameters
+    const params = new URLSearchParams(window.location.search);
+    const reference = params.get("reference") || params.get("trxref");
+
+    if (reference) {
+      const verifyPayment = async () => {
+        try {
+          const res = await axios.get(`/api/payments/verify/${reference}`);
+          if (res.data.status === "success") {
+            alert(`Payment successful! ₦${res.data.amount} has been added to your wallet.`);
+          } else if (res.data.status === "failed") {
+            alert(`Payment failed: ${res.data.message}`);
+          }
+          // Clear query params without page reload
+          const newUrl = window.location.pathname;
+          window.history.replaceState({}, document.title, newUrl);
+        } catch (e) {
+          console.error("Manual verification failed", e);
+        }
+      };
+      verifyPayment();
+    }
 
     // Listen to wallet
     const walletRef = doc(db, "wallets", user.uid);
@@ -170,7 +224,7 @@ export default function App() {
       } else {
         setWallet({ balance: 0, currency: "NGN" });
       }
-    }, (err) => handleFirestoreError(err, OperationType.GET, "wallets"));
+    }, (err) => handleFirestoreError(err, OperationType.GET, `wallets/${user.uid}`));
 
     // Listen to transactions
     const txnsQuery = query(
@@ -211,7 +265,19 @@ export default function App() {
       }
     } catch (e: any) {
       console.error("Auth error", e);
-      alert(e.message || "Authentication failed");
+      let errorMessage = "Authentication failed. Please try again.";
+      
+      if (e.code === "auth/email-already-in-use") {
+        errorMessage = "This email is already registered. Please sign in instead.";
+      } else if (e.code === "auth/invalid-credential") {
+        errorMessage = "Invalid email or password. Please check your details and try again.";
+      } else if (e.code === "auth/weak-password") {
+        errorMessage = "Password is too weak. Please use at least 6 characters.";
+      } else if (e.code === "auth/user-not-found" || e.code === "auth/wrong-password") {
+        errorMessage = "Invalid email or password.";
+      }
+      
+      alert(errorMessage);
     } finally {
       setAuthLoading(false);
     }
@@ -249,7 +315,7 @@ export default function App() {
       const optionsRes = await axios.post("/api/auth/register-options", {
         userId: user.uid,
         email: user.email,
-        displayName: user.displayName,
+        displayName: user.displayName || fullName,
       });
       
       const regResp = await startRegistration(optionsRes.data);
@@ -269,7 +335,53 @@ export default function App() {
     }
   };
 
+  const handleUpdateProfile = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!user) return;
+    setUpdateLoading(true);
+    try {
+      await axios.post("/api/user/profile", {
+        userId: user.uid,
+        displayName: fullName,
+        phone: phone
+      });
+      await updateProfile(user, { displayName: fullName });
+      alert("Profile updated successfully!");
+    } catch (e: any) {
+      console.error("Profile update failed", e);
+      alert(e.response?.data?.error || "Failed to update profile");
+    } finally {
+      setUpdateLoading(false);
+    }
+  };
+
   const handleLogout = () => signOut(auth);
+
+  const [reportReference, setReportReference] = useState("");
+  const [reportLoading, setReportLoading] = useState(false);
+  const [showReportModal, setShowReportModal] = useState(false);
+
+  const handleReportMissing = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!reportReference.trim()) return;
+    setReportLoading(true);
+    try {
+      const res = await axios.post("/api/payments/report-missing", {
+        reference: reportReference.trim(),
+        userId: user?.uid,
+        email: user?.email
+      });
+      alert(res.data.message);
+      setShowReportModal(false);
+      setReportReference("");
+    } catch (err: any) {
+      console.error("Report error", err);
+      const msg = err.response?.data?.message || err.response?.data?.error || "Failed to process report. Please try again.";
+      alert(msg);
+    } finally {
+      setReportLoading(false);
+    }
+  };
 
   const handleFundWallet = async () => {
     if (!fundAmount || isNaN(Number(fundAmount)) || Number(fundAmount) < 100) {
@@ -286,15 +398,16 @@ export default function App() {
         userId: user?.uid,
       });
 
-      const { checkoutUrl } = response.data;
+      const { checkoutUrl, error: initiateError, details } = response.data;
       if (checkoutUrl) {
         window.location.href = checkoutUrl;
       } else {
-        throw new Error("No checkout URL returned");
+        throw new Error(details || initiateError || "No checkout URL returned");
       }
-    } catch (e) {
+    } catch (e: any) {
       console.error("Funding failed", e);
-      alert("Failed to initiate funding. Please try again.");
+      const errorMsg = e.response?.data?.details || e.response?.data?.error || e.message || "Failed to initiate funding. Please try again.";
+      alert(errorMsg);
     } finally {
       setFundingLoading(false);
     }
@@ -509,152 +622,267 @@ export default function App() {
       </header>
 
       <main className="max-w-md mx-auto px-4 pt-8 space-y-6">
-        {/* Balance Card */}
-        <motion.div 
-          initial={{ opacity: 0, scale: 0.95 }}
-          animate={{ opacity: 1, scale: 1 }}
-          className="bg-blue-600 rounded-3xl p-8 text-white relative overflow-hidden shadow-2xl shadow-blue-200"
-        >
-          <div className="relative z-10">
-            <p className="text-blue-100 text-sm font-medium mb-1">Total Balance</p>
-            <h2 className="text-4xl font-bold flex items-baseline gap-2">
-              <span className="text-2xl font-normal opacity-80">₦</span>
-              {wallet?.balance.toLocaleString() || "0.00"}
-            </h2>
-            <div className="mt-8 flex gap-4">
-              <button 
-                onClick={() => setIsFundModalOpen(true)}
-                className="flex-1 bg-white text-blue-600 font-bold py-3 rounded-xl flex items-center justify-center gap-2 hover:bg-blue-50 transition-colors"
-              >
-                <Plus className="w-5 h-5" />
-                Fund
-              </button>
-              <button 
-                onClick={() => setIsSendModalOpen(true)}
-                className="flex-1 bg-blue-500/50 backdrop-blur-sm text-white font-bold py-3 rounded-xl flex items-center justify-center gap-2 hover:bg-white/20 transition-colors"
-              >
-                <ArrowUpRight className="w-5 h-5" />
-                Send
-              </button>
-            </div>
-          </div>
-          {/* Abstract background shapes */}
-          <div className="absolute -right-10 -bottom-10 w-40 h-40 bg-white opacity-10 rounded-full blur-3xl"></div>
-          <div className="absolute -left-10 -top-10 w-32 h-32 bg-blue-400 opacity-20 rounded-full blur-2xl"></div>
-        </motion.div>
-
-        {/* Info Grid */}
-        <div className="grid grid-cols-2 gap-4">
-          <div className="bg-white p-4 rounded-2xl border border-slate-100 shadow-sm flex items-center gap-3">
-            <div className="bg-emerald-100 p-2 rounded-lg text-emerald-600">
-              <TrendingUp className="w-5 h-5" />
-            </div>
-            <div>
-              <p className="text-[10px] text-slate-500 font-medium">Income</p>
-              <p className="font-bold text-sm">₦12k</p>
-            </div>
-          </div>
-          <div className="bg-white p-4 rounded-2xl border border-slate-100 shadow-sm flex items-center gap-3 text-slate-400 grayscale opacity-50">
-            <div className="bg-slate-100 p-2 rounded-lg">
-              <History className="w-5 h-5" />
-            </div>
-            <div>
-              <p className="text-[10px] font-medium">Coming Soon</p>
-              <p className="font-bold text-sm">Savings</p>
-            </div>
-          </div>
-        </div>
-
-        {/* Biometrics Toggle */}
-        {isBiometricsAvailable && (
-          <div className="bg-white p-4 rounded-2xl border border-slate-100 shadow-sm flex items-center justify-between">
-            <div className="flex items-center gap-3">
-              <div className="bg-blue-50 p-2 rounded-lg text-blue-600">
-                <Fingerprint className="w-5 h-5" />
-              </div>
-              <div>
-                <p className="text-sm font-bold">Biometric Login</p>
-                <p className="text-[10px] text-slate-500">Fast login with Touch/Face ID</p>
-              </div>
-            </div>
-            <button 
-              onClick={handleEnableBiometrics}
-              disabled={enablingBiometrics}
-              className={`px-4 py-2 rounded-lg text-xs font-bold transition-all ${
-                (user as any)?.biometricsEnabled 
-                ? "bg-slate-100 text-slate-400 cursor-not-allowed" 
-                : "bg-blue-600 text-white hover:bg-blue-700"
-              }`}
+        {activeTab === "home" ? (
+          <>
+            {/* Balance Card */}
+            <motion.div 
+              initial={{ opacity: 0, scale: 0.95 }}
+              animate={{ opacity: 1, scale: 1 }}
+              className="bg-blue-600 rounded-3xl p-8 text-white relative overflow-hidden shadow-2xl shadow-blue-200"
             >
-              {enablingBiometrics ? <Loader2 className="w-4 h-4 animate-spin" /> : ((user as any)?.biometricsEnabled ? "Enabled" : "Enable")}
-            </button>
-          </div>
-        )}
-
-        {/* Transactions */}
-        <div className="space-y-4">
-          <div className="flex items-center justify-between">
-            <h3 className="font-bold text-lg flex items-center gap-2">
-              <History className="w-5 h-5 text-blue-600" />
-              Transactions
-            </h3>
-            <button className="text-xs font-semibold text-blue-600 hover:underline">View All</button>
-          </div>
-
-          <div className="bg-white rounded-2xl border border-slate-100 overflow-hidden divide-y divide-slate-50">
-            {(!transactions || transactions.length === 0) ? (
-              <div className="p-8 text-center">
-                <p className="text-sm text-slate-400">No transactions yet</p>
+              <div className="relative z-10">
+                <p className="text-blue-100 text-sm font-medium mb-1">Total Balance</p>
+                <h2 className="text-4xl font-bold flex items-baseline gap-2">
+                  <span className="text-2xl font-normal opacity-80">₦</span>
+                  {wallet?.balance.toLocaleString() || "0.00"}
+                </h2>
+                <div className="mt-8 flex gap-4">
+                  <button 
+                    onClick={() => setIsFundModalOpen(true)}
+                    className="flex-1 bg-white text-blue-600 font-bold py-3 rounded-xl flex items-center justify-center gap-2 hover:bg-blue-50 transition-colors shadow-lg shadow-blue-900/10"
+                  >
+                    <Plus className="w-5 h-5" />
+                    Fund
+                  </button>
+                  <button 
+                    onClick={() => setIsSendModalOpen(true)}
+                    className="flex-1 bg-blue-500/50 backdrop-blur-sm text-white font-bold py-3 rounded-xl flex items-center justify-center gap-2 hover:bg-white/20 transition-colors"
+                  >
+                    <ArrowUpRight className="w-5 h-5" />
+                    Send
+                  </button>
+                </div>
               </div>
-            ) : (
-              transactions.map((tx) => (
-                <div key={tx.id} className="p-4 flex items-center justify-between hover:bg-slate-50 transition-colors">
-                  <div className="flex items-center gap-3">
-                    <div className={`p-2 rounded-full ${
-                      tx.status === "SUCCESS" 
-                        ? (tx.type === "FUNDING" ? "bg-green-100 text-green-600" : "bg-red-100 text-red-600") 
-                        : tx.status === "PENDING" ? "bg-amber-100 text-amber-600" : "bg-slate-100 text-slate-400"
-                    }`}>
-                      {tx.type === "FUNDING" ? <ArrowDownLeft className="w-4 h-4" /> : <ArrowUpRight className="w-4 h-4" />}
+              {/* Abstract background shapes */}
+              <div className="absolute -right-10 -bottom-10 w-40 h-40 bg-white opacity-10 rounded-full blur-3xl"></div>
+              <div className="absolute -left-10 -top-10 w-32 h-32 bg-blue-400 opacity-20 rounded-full blur-2xl"></div>
+            </motion.div>
+
+            {/* Info Grid */}
+            <div className="grid grid-cols-2 gap-4">
+              <div className="bg-white p-4 rounded-2xl border border-slate-100 shadow-sm flex items-center gap-3">
+                <div className="bg-emerald-100 p-2 rounded-lg text-emerald-600">
+                  <TrendingUp className="w-5 h-5" />
+                </div>
+                <div>
+                  <p className="text-[10px] text-slate-500 font-medium uppercase tracking-wider">Income</p>
+                  <p className="font-bold text-sm">₦{(transactions.filter(t => t.type === "FUNDING" && t.status === "SUCCESS").reduce((acc, t) => acc + t.amount, 0)).toLocaleString()}</p>
+                </div>
+              </div>
+              <div className="bg-white p-4 rounded-2xl border border-slate-100 shadow-sm flex items-center gap-3 text-slate-400">
+                <div className="bg-slate-50 p-2 rounded-lg text-slate-400">
+                  <ShieldCheck className="w-5 h-5" />
+                </div>
+                <div>
+                  <p className="text-[10px] font-medium uppercase tracking-wider">Account</p>
+                  <p className="font-bold text-sm text-slate-600 truncate max-w-[80px]">Active</p>
+                </div>
+              </div>
+            </div>
+
+            <button 
+              onClick={() => setShowReportModal(true)}
+              className="w-full py-4 text-slate-500 text-xs font-bold uppercase tracking-widest bg-white border border-slate-100 rounded-2xl hover:bg-slate-50 transition-colors flex items-center justify-center gap-2"
+            >
+              <HelpCircle className="w-4 h-4" />
+              Payment not reflecting? Click here
+            </button>
+
+            {/* Transactions */}
+            <div className="space-y-4">
+              <div className="flex items-center justify-between px-1">
+                <h3 className="font-bold text-lg flex items-center gap-2 text-slate-800">
+                  <History className="w-5 h-5 text-blue-600" />
+                  Recent Activity
+                </h3>
+                <button className="text-xs font-bold text-blue-600 hover:text-blue-700">View All</button>
+              </div>
+
+              <div className="bg-white rounded-3xl border border-slate-100 overflow-hidden divide-y divide-slate-50 shadow-sm">
+                {(!transactions || transactions.length === 0) ? (
+                  <div className="p-12 text-center space-y-2">
+                    <div className="w-12 h-12 bg-slate-50 rounded-full flex items-center justify-center mx-auto mb-2 text-slate-300">
+                      <History className="w-6 h-6" />
                     </div>
-                    <div>
-                      <p className="text-sm font-bold truncate max-w-[150px]">{tx.description}</p>
-                      <div className="flex items-center gap-2">
-                        <p className="text-[10px] text-slate-400">
-                          {tx.createdAt?.toDate ? tx.createdAt.toDate().toLocaleDateString() : "Just now"}
-                        </p>
-                        <span className="text-[10px] text-slate-300">•</span>
-                        <div 
-                          title={
-                            tx.status === "PENDING" ? "Transfer is being processed by the bank. Please wait." : 
-                            tx.status === "SUCCESS" ? "Transaction successfully completed." : 
-                            "Transaction failed. Any deducted funds will be reversed."
-                          }
-                          className={`flex items-center gap-1 px-1.5 py-0.5 rounded text-[9px] font-bold uppercase tracking-wider cursor-help ${
-                            tx.status === "SUCCESS" ? "bg-green-50 text-green-700" :
-                            tx.status === "PENDING" ? "bg-amber-50 text-amber-700 animate-pulse" :
-                            "bg-red-50 text-red-700"
-                          }`}
-                        >
-                          {tx.status === "PENDING" && <Loader2 className="w-2.5 h-2.5 animate-spin" />}
-                          {tx.status}
+                    <p className="text-sm font-bold text-slate-900">No transactions yet</p>
+                    <p className="text-xs text-slate-400">Your recent payments will appear here</p>
+                  </div>
+                ) : (
+                  transactions.slice(0, 10).map((tx) => (
+                    <motion.div 
+                      initial={{ opacity: 0 }}
+                      animate={{ opacity: 1 }}
+                      key={tx.id} 
+                      className="p-4 flex items-center justify-between hover:bg-slate-50/50 transition-colors"
+                    >
+                      <div className="flex items-center gap-3">
+                        <div className={`p-2.5 rounded-2xl ${
+                          tx.status === "SUCCESS" 
+                            ? (tx.type === "FUNDING" ? "bg-emerald-50 text-emerald-600" : "bg-red-50 text-red-600") 
+                            : tx.status === "PENDING" ? "bg-amber-50 text-amber-600" : "bg-slate-100 text-slate-400"
+                        }`}>
+                          {tx.type === "FUNDING" ? <ArrowDownLeft className="w-4 h-4" /> : <ArrowUpRight className="w-4 h-4" />}
+                        </div>
+                        <div>
+                          <p className="text-sm font-bold text-slate-900 truncate max-w-[150px]">{tx.description}</p>
+                          <div className="flex items-center gap-2">
+                            <p className="text-[10px] text-slate-400 font-medium">
+                              {tx.createdAt?.toDate ? tx.createdAt.toDate().toLocaleDateString() : "Just now"}
+                            </p>
+                            <span className="text-[10px] text-slate-200">•</span>
+                            <div 
+                              title={
+                                tx.status === "PENDING" ? "Transfer is being processed by the bank. Please wait." : 
+                                tx.status === "SUCCESS" ? "Transaction successfully completed." : 
+                                "Transaction failed. Any deducted funds will be reversed."
+                              }
+                              className={`flex items-center gap-1.5 px-2 py-0.5 rounded-full text-[9px] font-bold uppercase tracking-wider cursor-help border ${
+                                tx.status === "SUCCESS" ? "bg-emerald-50 text-emerald-700 border-emerald-100" :
+                                tx.status === "PENDING" ? "bg-amber-50 text-amber-700 border-amber-100 animate-pulse" :
+                                "bg-red-50 text-red-700 border-red-100"
+                              }`}
+                            >
+                              {tx.status === "PENDING" && <Loader2 className="w-2.5 h-2.5 animate-spin" />}
+                              {tx.status}
+                            </div>
+                          </div>
                         </div>
                       </div>
-                    </div>
-                  </div>
-                  <div className="text-right">
-                    <p className={`text-sm font-bold ${
-                      tx.type === "FUNDING" ? "text-green-600" : "text-slate-900"
-                    }`}>
-                      {tx.type === "FUNDING" ? "+" : "-"}₦{tx.amount.toLocaleString()}
-                    </p>
+                      <div className="text-right">
+                        <p className={`text-sm font-bold ${
+                          tx.type === "FUNDING" ? "text-emerald-600" : "text-slate-900"
+                        }`}>
+                          {tx.type === "FUNDING" ? "+" : "-"}₦{tx.amount.toLocaleString()}
+                        </p>
+                      </div>
+                    </motion.div>
+                  ))
+                )}
+              </div>
+            </div>
+          </>
+        ) : (
+          <motion.div 
+            initial={{ opacity: 0, x: 20 }}
+            animate={{ opacity: 1, x: 0 }}
+            className="space-y-6"
+          >
+            <div className="flex items-center justify-between px-1">
+              <h3 className="font-bold text-lg text-slate-900">Profile Settings</h3>
+            </div>
+
+            <div className="bg-white rounded-3xl border border-slate-100 p-6 shadow-sm space-y-6">
+              <div className="flex flex-col items-center gap-4 py-4">
+                <div className="w-20 h-20 bg-blue-100 rounded-full flex items-center justify-center text-blue-600 font-bold text-2xl border-4 border-white shadow-lg overflow-hidden">
+                  {user.photoURL ? (
+                    <img src={user.photoURL} alt={user.displayName || ""} className="w-full h-full object-cover" />
+                  ) : (
+                    (user.displayName || "U").charAt(0)
+                  )}
+                </div>
+                <div className="text-center">
+                  <p className="font-bold text-lg">{user.displayName || "User"}</p>
+                  <p className="text-xs text-slate-500 font-medium uppercase tracking-widest">{user.email}</p>
+                </div>
+              </div>
+
+              <form onSubmit={handleUpdateProfile} className="space-y-4">
+                <div className="space-y-1">
+                  <label className="text-[10px] font-bold text-slate-400 ml-1 uppercase tracking-wider">Display Name</label>
+                  <div className="relative">
+                    <UserIcon className="absolute left-4 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400" />
+                    <input 
+                      type="text"
+                      value={fullName}
+                      onChange={(e) => setFullName(e.target.value)}
+                      placeholder="Enter full name"
+                      className="w-full bg-slate-50 border border-slate-100 rounded-2xl py-3.5 pl-11 pr-4 text-sm font-bold focus:outline-none focus:ring-2 focus:ring-blue-600/20"
+                    />
                   </div>
                 </div>
-              ))
+
+                <div className="space-y-1">
+                  <label className="text-[10px] font-bold text-slate-400 ml-1 uppercase tracking-wider">Phone Number</label>
+                  <div className="relative">
+                    <Phone className="absolute left-4 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400" />
+                    <input 
+                      type="tel"
+                      value={phone}
+                      onChange={(e) => setPhone(e.target.value)}
+                      placeholder="+234..."
+                      className="w-full bg-slate-50 border border-slate-100 rounded-2xl py-3.5 pl-11 pr-4 text-sm font-bold focus:outline-none focus:ring-2 focus:ring-blue-600/20"
+                    />
+                  </div>
+                </div>
+
+                <button 
+                  type="submit"
+                  disabled={updateLoading}
+                  className="w-full bg-blue-600 text-white font-bold py-3.5 rounded-2xl shadow-lg shadow-blue-100 hover:bg-blue-700 transition-all flex items-center justify-center gap-2"
+                >
+                  {updateLoading ? <Loader2 className="w-5 h-5 animate-spin" /> : "Save Changes"}
+                </button>
+              </form>
+            </div>
+
+            {/* Biometrics Management */}
+            {isBiometricsAvailable && (
+              <div className="bg-white p-6 rounded-3xl border border-slate-100 shadow-sm space-y-4">
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center gap-3">
+                    <div className="bg-blue-50 p-2.5 rounded-2xl text-blue-600">
+                      <Fingerprint className="w-5 h-5" />
+                    </div>
+                    <div>
+                      <p className="text-sm font-bold">Biometric Login</p>
+                      <p className="text-[10px] text-slate-500 font-medium">Use Touch ID / Face ID</p>
+                    </div>
+                  </div>
+                  <button 
+                    onClick={handleEnableBiometrics}
+                    disabled={enablingBiometrics}
+                    className={`px-6 py-2 rounded-xl text-xs font-bold transition-all shadow-sm ${
+                      (user as any)?.biometricsEnabled 
+                      ? "bg-slate-100 text-slate-400 cursor-not-allowed" 
+                      : "bg-blue-600 text-white hover:bg-blue-700"
+                    }`}
+                  >
+                    {enablingBiometrics ? <Loader2 className="w-4 h-4 animate-spin" /> : ((user as any)?.biometricsEnabled ? "Enabled" : "Enable")}
+                  </button>
+                </div>
+              </div>
             )}
-          </div>
-        </div>
+            
+            <button 
+              onClick={handleLogout}
+              className="w-full py-4 text-red-600 font-bold text-sm bg-red-50 rounded-3xl border border-red-100 hover:bg-red-100 transition-colors flex items-center justify-center gap-2"
+            >
+              <LogOut className="w-4 h-4" />
+              Sign Out Account
+            </button>
+          </motion.div>
+        )}
       </main>
+
+      {/* Bottom Navigation */}
+      <nav className="fixed bottom-0 left-0 right-0 z-40 bg-white/95 backdrop-blur-md border-t border-slate-100 px-6 py-3">
+        <div className="max-w-md mx-auto flex items-center justify-around">
+          <button 
+            onClick={() => setActiveTab("home")}
+            className={`flex flex-col items-center gap-1 transition-colors ${activeTab === "home" ? "text-blue-600" : "text-slate-400"}`}
+          >
+            <Wallet className={`w-5 h-5 ${activeTab === "home" ? "fill-blue-600/10" : ""}`} />
+            <span className="text-[10px] font-bold uppercase tracking-widest">Home</span>
+          </button>
+          <button 
+            onClick={() => setActiveTab("profile")}
+            className={`flex flex-col items-center gap-1 transition-colors ${activeTab === "profile" ? "text-blue-600" : "text-slate-400"}`}
+          >
+            <UserIcon className={`w-5 h-5 ${activeTab === "profile" ? "fill-blue-600/10" : ""}`} />
+            <span className="text-[10px] font-bold uppercase tracking-widest">Profile</span>
+          </button>
+        </div>
+      </nav>
 
       {/* Fund Modal */}
       <AnimatePresence>
@@ -820,6 +1048,64 @@ export default function App() {
                 <p className="text-[10px] text-center text-slate-400">
                   Transactions are final once initiated. Ensure recipient details are correct.
                 </p>
+              </div>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+
+      {/* Report Modal */}
+      <AnimatePresence>
+        {showReportModal && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
+            <motion.div 
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              onClick={() => setShowReportModal(false)}
+              className="absolute inset-0 bg-slate-900/40 backdrop-blur-sm"
+            />
+            <motion.div 
+              initial={{ opacity: 0, scale: 0.9, y: 20 }}
+              animate={{ opacity: 1, scale: 1, y: 0 }}
+              exit={{ opacity: 0, scale: 0.9, y: 20 }}
+              className="bg-white w-full max-w-sm rounded-3xl p-6 relative z-10 shadow-2xl"
+            >
+              <div className="flex items-center justify-between mb-4">
+                <h3 className="text-xl font-bold">Find Payment</h3>
+                <button onClick={() => setShowReportModal(false)} className="text-slate-400 hover:text-slate-600">
+                  <Plus className="w-6 h-6 rotate-45" />
+                </button>
+              </div>
+              
+              <div className="space-y-4">
+                <div className="p-4 bg-blue-50 rounded-2xl border border-blue-100 italic">
+                  <p className="text-[11px] text-blue-700 leading-relaxed">
+                    "If you paid but your balance didn't increase, enter the reference number from your receipt/email. We'll find it and credit you instantly."
+                  </p>
+                </div>
+
+                <form onSubmit={handleReportMissing} className="space-y-4">
+                  <div className="space-y-1">
+                    <label className="text-[10px] uppercase font-bold text-slate-500 tracking-wider ml-1">Paystack Reference</label>
+                    <input 
+                      type="text" 
+                      required
+                      value={reportReference}
+                      onChange={(e) => setReportReference(e.target.value)}
+                      placeholder="e.g. 7q9w2e8r5..."
+                      className="w-full bg-slate-50 border border-slate-100 rounded-xl py-3 px-4 font-bold text-sm focus:outline-none focus:ring-2 focus:ring-blue-600/20"
+                    />
+                  </div>
+                  
+                  <button 
+                    type="submit"
+                    disabled={reportLoading}
+                    className="w-full bg-blue-600 text-white font-bold py-4 rounded-xl shadow-lg hover:bg-blue-700 disabled:bg-slate-200 transition-all flex items-center justify-center gap-2"
+                  >
+                    {reportLoading ? <Loader2 className="w-5 h-5 animate-spin" /> : "Verify Reference"}
+                  </button>
+                </form>
               </div>
             </motion.div>
           </div>
