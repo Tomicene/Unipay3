@@ -49,18 +49,26 @@ async function startServer() {
   };
 
   const rpName = "Unipay";
-  // Dynamically determine rpID and origin to support multiple domains (custom domains + dev URLs)
-  const getWebAuthnConfig = (req: express.Request) => {
-    const host = req.headers.host || "localhost";
-    const proto = req.headers["x-forwarded-proto"] || (req.secure ? "https" : "http");
-    const currentOrigin = `${proto}://${host}`;
+  const getRequestOrigin = (req: express.Request) => {
+    // Priority: x-forwarded-host (from proxy), x-forwarded-proto, then host header
+    const host = (req.headers["x-forwarded-host"] as string) || req.headers.host || "localhost";
+    const proto = (req.headers["x-forwarded-proto"] as string) || (req.secure ? "https" : "http");
+    const firstProto = proto.split(",")[0].trim();
     
-    // rpID must be the domain without port
-    const currentRpID = host.split(":")[0];
+    // Safety check for absolute URL in host header
+    const cleanHost = host.startsWith("http") ? new URL(host).host : host;
+    const origin = `${firstProto}://${cleanHost}`;
     
-    console.log("WebAuthn Config:", { currentRpID, currentOrigin });
-    return { currentRpID, currentOrigin };
+    // Log origin for debugging (will show in server console)
+    console.log(`[REQUEST] ${req.method} ${req.url} - Origin: ${origin}`);
+    return origin;
   };
+
+  // Add global request logger
+  app.use((req, res, next) => {
+    getRequestOrigin(req); // This logs it
+    next();
+  });
 
   // Temporal store for challenges (In production, use Redis or a DB)
   const userChallenges = new Map<string, string>();
@@ -71,7 +79,8 @@ async function startServer() {
       const { userId, email, displayName } = req.body;
       if (!userId) return res.status(400).json({ error: "userId required" });
 
-      const { currentRpID } = getWebAuthnConfig(req);
+      const host = (req.headers["x-forwarded-host"] as string) || req.headers.host || "localhost";
+      const currentRpID = host.split(":")[0];
 
       const db = getDB();
       const userDoc = await db.collection("users").doc(userId).get();
@@ -106,7 +115,9 @@ async function startServer() {
     const { userId, body } = req.body;
     const expectedChallenge = userChallenges.get(userId);
 
-    const { currentRpID, currentOrigin } = getWebAuthnConfig(req);
+    const currentOrigin = getRequestOrigin(req);
+    const host = (req.headers["x-forwarded-host"] as string) || req.headers.host || "localhost";
+    const currentRpID = host.split(":")[0];
 
     if (!expectedChallenge) return res.status(400).json({ error: "Challenge not found. Please try again." });
 
@@ -153,7 +164,8 @@ async function startServer() {
       const { email } = req.body;
       if (!email) return res.status(400).json({ error: "Email required" });
 
-      const { currentRpID } = getWebAuthnConfig(req);
+      const host = (req.headers["x-forwarded-host"] as string) || req.headers.host || "localhost";
+      const currentRpID = host.split(":")[0];
 
       const db = getDB();
       const usersSnap = await db.collection("users").where("email", "==", email).limit(1).get();
@@ -191,7 +203,9 @@ async function startServer() {
       const { email, body } = req.body;
       const expectedChallenge = userChallenges.get(email);
 
-      const { currentRpID, currentOrigin } = getWebAuthnConfig(req);
+      const currentOrigin = getRequestOrigin(req);
+      const host = (req.headers["x-forwarded-host"] as string) || req.headers.host || "localhost";
+      const currentRpID = host.split(":")[0];
 
       if (!expectedChallenge) return res.status(400).json({ error: "Challenge expired. Please refresh and try again." });
 
@@ -254,21 +268,36 @@ async function startServer() {
     try {
       const { amount, customerEmail, userId } = req.body;
       if (!userId) return res.status(400).json({ error: "userId is required" });
+      if (!amount || isNaN(Number(amount))) return res.status(400).json({ error: "Valid amount is required" });
       
       const PAYSTACK_SECRET = process.env.PAYSTACK_SECRET_KEY;
       if (!PAYSTACK_SECRET) {
         console.error("PAYSTACK_SECRET_KEY is missing in environment variables");
-        return res.status(500).json({ error: "Server configuration error: Paystack key missing" });
+        return res.status(500).json({ error: "Paystack is not configured on this server" });
+      }
+
+      // Fallback for email if missing from request
+      let email = customerEmail;
+      const db = getDB();
+      if (!email) {
+        const userDoc = await db.collection("users").doc(userId).get();
+        email = userDoc.data()?.email;
+      }
+      
+      if (!email) {
+        return res.status(400).json({ error: "User email is required for payment" });
       }
 
       const reference = `unipay_ps_${uuidv4().replace(/-/g, "")}`;
-      const appUrl = process.env.APP_URL || origin;
+      // In this environment, we should prioritize the dynamic origin
+      const currentOrigin = getRequestOrigin(req);
+      const appUrl = currentOrigin;
 
       const payload = {
         amount: Math.round(Number(amount) * 100), // Paystack uses kobo
-        email: customerEmail,
+        email: email,
         reference: reference,
-        callback_url: `${appUrl}/dashboard`,
+        callback_url: `${appUrl}/api/payments/verify/${reference}`,
         metadata: {
           userId: userId,
         },
@@ -296,35 +325,25 @@ async function startServer() {
         });
       }
 
-      if (!response.data.data?.authorization_url) {
-        return res.status(500).json({ 
-          error: "Internal error", 
-          details: "No authorization URL returned from Paystack" 
-        });
-      }
-
       res.json({ 
         checkoutUrl: response.data.data.authorization_url, 
         reference 
       });
     } catch (error: any) {
-      console.error("Paystack initiation error details:", {
-        message: error.message,
-        response: error.response?.data,
-        config: error.config ? { url: error.config.url, data: error.config.data } : "No config"
-      });
+      console.error("Paystack initiation error:", error.response?.data || error.message);
       res.status(500).json({ 
-        error: "Failed to initiate payment", 
+        error: "Failed to initiate payment. Please try again.", 
         details: error.response?.data?.message || error.message 
       });
     }
   });
 
-  // Webhook Endpoint for Paystack
+  // Paystack Webhook (Consolidated)
   app.post("/api/webhooks/paystack", async (req, res) => {
     try {
+      const PAYSTACK_SECRET = process.env.PAYSTACK_SECRET_KEY || "";
       const hash = crypto
-        .createHmac("sha512", process.env.PAYSTACK_SECRET_KEY || "")
+        .createHmac("sha512", PAYSTACK_SECRET)
         .update(JSON.stringify(req.body))
         .digest("hex");
 
@@ -466,7 +485,7 @@ async function startServer() {
     }
   });
 
-  // Verification Endpoint (Manual fallback)
+  // Verification Endpoint (Manual fallback & Success Redirect)
   app.get("/api/payments/verify/:reference", async (req, res) => {
     try {
       const { reference } = req.params;
@@ -514,15 +533,28 @@ async function startServer() {
               createdAt: FieldValue.serverTimestamp(),
             }, { merge: true });
           });
-
-          return res.json({ status: "success", amount: amountPaid });
         }
+        
+        // Success Redirect
+        return res.send(`
+          <html>
+            <head><title>Payment Successful</title></head>
+            <body>
+              <script>
+                alert("Payment Successful! ₦${amountPaid} has been added to your balance.");
+                window.location.href = "/dashboard";
+              </script>
+              <p>Payment Successful! Redirecting to dashboard...</p>
+              <p><a href="/dashboard">Click here if not redirected</a></p>
+            </body>
+          </html>
+        `);
       }
       
-      res.json({ status: data.status, message: data.gateway_response });
+      res.redirect("/dashboard?error=payment_failed");
     } catch (error: any) {
       console.error("Verification error:", error.response?.data || error.message);
-      res.status(500).json({ error: "Failed to verify transaction" });
+      res.redirect("/dashboard?error=verification_failed");
     }
   });
 
@@ -535,8 +567,6 @@ async function startServer() {
       const db = getDB();
       const userRef = db.collection("users").doc(userId);
 
-      console.log(`Updating profile for user ${userId}:`, { displayName, phone });
-
       await userRef.set({
         displayName,
         phone,
@@ -545,63 +575,8 @@ async function startServer() {
 
       res.json({ message: "Profile updated successfully" });
     } catch (error: any) {
-      console.error("Profile update error detail:", {
-        message: error.message,
-        code: error.code,
-        details: error.details,
-        stack: error.stack
-      });
+      console.error("Profile update error:", error);
       res.status(500).json({ error: `Failed to update profile: ${error.message}` });
-    }
-  });
-
-  // 2. Paystack Webhook
-  app.post("/api/webhooks/paystack", async (req, res) => {
-    try {
-      const event = req.body;
-      // In production, verify signature using x-paystack-signature
-      
-      if (event.event === "charge.success") {
-        const transactionData = event.data;
-        const { reference, amount, metadata } = transactionData;
-        const userId = metadata?.userId;
-        const amountPaid = amount / 100; // Convert back from kobo
-
-        if (userId) {
-          const db = getDB();
-          const walletRef = db.collection("wallets").doc(userId);
-          const txnRef = db.collection("transactions").doc(reference);
-
-          await db.runTransaction(async (t) => {
-            const walletDoc = await t.get(walletRef);
-            const currentBalance = walletDoc.exists ? (walletDoc.data()?.balance || 0) : 0;
-            
-            t.set(walletRef, {
-              userId,
-              balance: currentBalance + amountPaid,
-              currency: "NGN",
-              updatedAt: FieldValue.serverTimestamp(),
-            }, { merge: true });
-
-            t.set(txnRef, {
-              userId,
-              amount: amountPaid,
-              type: "FUNDING",
-              status: "SUCCESS",
-              reference: reference,
-              description: "Wallet Funding via Paystack",
-              createdAt: FieldValue.serverTimestamp(),
-            });
-          });
-
-          console.log(`Successfully credited wallet for user ${userId}: +${amountPaid}`);
-        }
-      }
-      
-      res.sendStatus(200);
-    } catch (error) {
-      console.error("Webhook error:", error);
-      res.sendStatus(500);
     }
   });
 
@@ -733,6 +708,12 @@ async function startServer() {
   // Health check
   app.get("/api/health", (req, res) => {
     res.json({ status: "ok" });
+  });
+
+  // API 404 Catch-all
+  app.all("/api/*", (req, res) => {
+    console.warn(`[404] API Route Not Found: ${req.method} ${req.url}`);
+    res.status(404).json({ error: "API route not found" });
   });
 
   // Vite middleware for development
