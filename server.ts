@@ -49,54 +49,73 @@ async function startServer() {
   };
 
   const rpName = "Unipay";
-  const rpID = process.env.APP_URL ? new URL(process.env.APP_URL).hostname : "localhost";
-  const origin = process.env.APP_URL || `http://localhost:${PORT}`;
+  // Dynamically determine rpID and origin to support multiple domains (custom domains + dev URLs)
+  const getWebAuthnConfig = (req: express.Request) => {
+    const host = req.headers.host || "localhost";
+    const proto = req.headers["x-forwarded-proto"] || (req.secure ? "https" : "http");
+    const currentOrigin = `${proto}://${host}`;
+    
+    // rpID must be the domain without port
+    const currentRpID = host.split(":")[0];
+    
+    console.log("WebAuthn Config:", { currentRpID, currentOrigin });
+    return { currentRpID, currentOrigin };
+  };
 
   // Temporal store for challenges (In production, use Redis or a DB)
   const userChallenges = new Map<string, string>();
 
   // WebAuthn Routes
   app.post("/api/auth/register-options", async (req, res) => {
-    const { userId, email, displayName } = req.body;
-    if (!userId) return res.status(400).json({ error: "userId required" });
+    try {
+      const { userId, email, displayName } = req.body;
+      if (!userId) return res.status(400).json({ error: "userId required" });
 
-    const db = getDB();
-    const userDoc = await db.collection("users").doc(userId).get();
-    const userAuthenticators = userDoc.data()?.authenticators || [];
+      const { currentRpID } = getWebAuthnConfig(req);
 
-    const options = await generateRegistrationOptions({
-      rpName,
-      rpID,
-      userID: Buffer.from(userId),
-      userName: email,
-      userDisplayName: displayName || email,
-      attestationType: "none",
-      excludeCredentials: userAuthenticators.map((auth: any) => ({
-        id: isoBase64URL.toBuffer(auth.credentialID),
-        type: "public-key",
-      })),
-      authenticatorSelection: {
-        residentKey: "preferred",
-        userVerification: "preferred",
-      },
-    });
+      const db = getDB();
+      const userDoc = await db.collection("users").doc(userId).get();
+      const userAuthenticators = userDoc.data()?.authenticators || [];
 
-    userChallenges.set(userId, options.challenge);
-    res.json(options);
+      const options = await generateRegistrationOptions({
+        rpName,
+        rpID: currentRpID,
+        userID: Buffer.from(userId),
+        userName: email,
+        userDisplayName: displayName || email,
+        attestationType: "none",
+        excludeCredentials: userAuthenticators.map((auth: any) => ({
+          id: isoBase64URL.toBuffer(auth.credentialID),
+          type: "public-key",
+        })),
+        authenticatorSelection: {
+          residentKey: "preferred",
+          userVerification: "preferred",
+        },
+      });
+
+      userChallenges.set(userId, options.challenge);
+      res.json(options);
+    } catch (error: any) {
+      console.error("Register options error:", error);
+      res.status(500).json({ error: error.message });
+    }
   });
 
   app.post("/api/auth/verify-registration", async (req, res) => {
     const { userId, body } = req.body;
     const expectedChallenge = userChallenges.get(userId);
 
-    if (!expectedChallenge) return res.status(400).json({ error: "Challenge not found" });
+    const { currentRpID, currentOrigin } = getWebAuthnConfig(req);
+
+    if (!expectedChallenge) return res.status(400).json({ error: "Challenge not found. Please try again." });
 
     try {
       const verification = await verifyRegistrationResponse({
         response: body,
         expectedChallenge,
-        expectedOrigin: origin,
-        expectedRPID: rpID,
+        expectedOrigin: currentOrigin,
+        expectedRPID: currentRpID,
       });
 
       if (verification.verified && verification.registrationInfo) {
@@ -121,69 +140,84 @@ async function startServer() {
         userChallenges.delete(userId);
         res.json({ verified: true });
       } else {
-        res.status(400).json({ error: "Verification failed" });
+        res.status(400).json({ error: "Biometric verification failed" });
       }
     } catch (error: any) {
-      console.error(error);
+      console.error("Verify registration error:", error);
       res.status(400).json({ error: error.message });
     }
   });
 
   app.post("/api/auth/login-options", async (req, res) => {
-    const { email } = req.body;
-    if (!email) return res.status(400).json({ error: "Email required" });
+    try {
+      const { email } = req.body;
+      if (!email) return res.status(400).json({ error: "Email required" });
 
-    const db = getDB();
-    const usersSnap = await db.collection("users").where("email", "==", email).limit(1).get();
-    
-    if (usersSnap.empty) return res.status(404).json({ error: "User not found" });
-    
-    const userDoc = usersSnap.docs[0];
-    const userData = userDoc.data();
-    const userAuthenticators = userData.authenticators || [];
+      const { currentRpID } = getWebAuthnConfig(req);
 
-    if (userAuthenticators.length === 0) {
-      return res.status(400).json({ error: "No biometrics registered for this email" });
+      const db = getDB();
+      const usersSnap = await db.collection("users").where("email", "==", email).limit(1).get();
+      
+      if (usersSnap.empty) return res.status(404).json({ error: "No user found with this email" });
+      
+      const userDoc = usersSnap.docs[0];
+      const userData = userDoc.data();
+      const userAuthenticators = userData.authenticators || [];
+
+      if (userAuthenticators.length === 0) {
+        return res.status(400).json({ error: "No biometrics registered for this email. Please log in with password and enable biometrics in profile." });
+      }
+
+      const options = await generateAuthenticationOptions({
+        rpID: currentRpID,
+        allowCredentials: userAuthenticators.map((auth: any) => ({
+          id: isoBase64URL.toBuffer(auth.credentialID),
+          type: "public-key",
+          transports: auth.transports,
+        })),
+        userVerification: "preferred",
+      });
+
+      userChallenges.set(email, options.challenge);
+      res.json(options);
+    } catch (error: any) {
+      console.error("Login options error:", error);
+      res.status(500).json({ error: error.message });
     }
-
-    const options = await generateAuthenticationOptions({
-      rpID,
-      allowCredentials: userAuthenticators.map((auth: any) => ({
-        id: isoBase64URL.toBuffer(auth.credentialID),
-        type: "public-key",
-        transports: auth.transports,
-      })),
-      userVerification: "preferred",
-    });
-
-    userChallenges.set(email, options.challenge);
-    res.json(options);
   });
 
   app.post("/api/auth/verify-login", async (req, res) => {
-    const { email, body } = req.body;
-    const expectedChallenge = userChallenges.get(email);
-
-    if (!expectedChallenge) return res.status(400).json({ error: "Challenge not found" });
-
-    const db = getDB();
-    const usersSnap = await db.collection("users").where("email", "==", email).limit(1).get();
-    const userDoc = usersSnap.docs[0];
-    const userData = userDoc.data();
-    const userId = userDoc.id;
-    
-    const authenticator = userData.authenticators.find(
-      (auth: any) => auth.credentialID === body.id
-    );
-
-    if (!authenticator) return res.status(400).json({ error: "Authenticator not found" });
-
     try {
+      const { email, body } = req.body;
+      const expectedChallenge = userChallenges.get(email);
+
+      const { currentRpID, currentOrigin } = getWebAuthnConfig(req);
+
+      if (!expectedChallenge) return res.status(400).json({ error: "Challenge expired. Please refresh and try again." });
+
+      const db = getDB();
+      const usersSnap = await db.collection("users").where("email", "==", email).limit(1).get();
+      
+      if (usersSnap.empty) return res.status(404).json({ error: "User not found" });
+      
+      const userDoc = usersSnap.docs[0];
+      const userData = userDoc.data();
+      const userId = userDoc.id;
+      
+      const authenticator = (userData.authenticators || []).find(
+        (auth: any) => auth.credentialID === body.id
+      );
+
+      if (!authenticator) {
+        console.error("Authenticator not matches stored credentials", { bodyId: body.id, stored: userData.authenticators?.map((a:any)=>a.id) });
+        return res.status(400).json({ error: "This biometric key is not registered to your account." });
+      }
+
       const verification = await verifyAuthenticationResponse({
         response: body,
         expectedChallenge,
-        expectedOrigin: origin,
-        expectedRPID: rpID,
+        expectedOrigin: currentOrigin,
+        expectedRPID: currentRpID,
         credential: {
           id: authenticator.credentialID,
           publicKey: isoBase64URL.toBuffer(authenticator.credentialPublicKey),
@@ -207,10 +241,10 @@ async function startServer() {
         userChallenges.delete(email);
         res.json({ verified: true, customToken });
       } else {
-        res.status(400).json({ error: "Verification failed" });
+        res.status(400).json({ error: "Biometric authentication failed" });
       }
     } catch (error: any) {
-      console.error(error);
+      console.error("Verify login error:", error);
       res.status(400).json({ error: error.message });
     }
   });

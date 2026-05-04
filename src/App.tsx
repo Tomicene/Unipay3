@@ -251,6 +251,14 @@ export default function App() {
     }
   };
 
+  const getErrorMessage = (e: any) => {
+    if (typeof e === "string") return e;
+    if (e.response?.data?.details) return typeof e.response.data.details === "string" ? e.response.data.details : JSON.stringify(e.response.data.details);
+    if (e.response?.data?.error) return typeof e.response.data.error === "string" ? e.response.data.error : JSON.stringify(e.response.data.error);
+    if (e.message) return e.message;
+    return JSON.stringify(e);
+  };
+
   const handleEmailAuth = async (e: React.FormEvent) => {
     e.preventDefault();
     setAuthLoading(true);
@@ -275,6 +283,8 @@ export default function App() {
         errorMessage = "Password is too weak. Please use at least 6 characters.";
       } else if (e.code === "auth/user-not-found" || e.code === "auth/wrong-password") {
         errorMessage = "Invalid email or password.";
+      } else if (e.code === "auth/popup-closed-by-user") {
+        errorMessage = "Login cancelled.";
       }
       
       alert(errorMessage);
@@ -302,7 +312,8 @@ export default function App() {
       }
     } catch (e: any) {
       console.error("Biometric login failed", e);
-      alert(e.response?.data?.error || "Biometric login failed. Make sure you have registered biometrics for this device.");
+      const msg = getErrorMessage(e);
+      alert("Biometric Login Failed: " + msg);
     } finally {
       setAuthLoading(false);
     }
@@ -329,7 +340,8 @@ export default function App() {
       }
     } catch (e: any) {
       console.error("Failed to enable biometrics", e);
-      alert(e.response?.data?.error || "Failed to enable biometrics. Ensure you are in a secure context and have biometrics set up on your device.");
+      const msg = getErrorMessage(e);
+      alert("Enable Biometrics Failed: " + msg);
     } finally {
       setEnablingBiometrics(false);
     }
@@ -349,7 +361,7 @@ export default function App() {
       alert("Profile updated successfully!");
     } catch (e: any) {
       console.error("Profile update failed", e);
-      alert(e.response?.data?.error || "Failed to update profile");
+      alert(getErrorMessage(e));
     } finally {
       setUpdateLoading(false);
     }
@@ -376,8 +388,7 @@ export default function App() {
       setReportReference("");
     } catch (err: any) {
       console.error("Report error", err);
-      const msg = err.response?.data?.message || err.response?.data?.error || "Failed to process report. Please try again.";
-      alert(msg);
+      alert(getErrorMessage(err));
     } finally {
       setReportLoading(false);
     }
@@ -406,8 +417,7 @@ export default function App() {
       }
     } catch (e: any) {
       console.error("Funding failed", e);
-      const errorMsg = e.response?.data?.details || e.response?.data?.error || e.message || "Failed to initiate funding. Please try again.";
-      alert(errorMsg);
+      alert(getErrorMessage(e));
     } finally {
       setFundingLoading(false);
     }
@@ -447,7 +457,7 @@ export default function App() {
       setTransferNarration("");
     } catch (e: any) {
       console.error("Transfer failed", e);
-      alert(e.response?.data?.error || "Transfer failed");
+      alert(getErrorMessage(e));
     } finally {
       setTransferLoading(false);
     }
